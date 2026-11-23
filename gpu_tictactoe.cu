@@ -1,203 +1,397 @@
-// gpu_tictactoe.cu
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+
 #include <cuda_runtime.h>
 
-#define BOARD_SIZE 9
+constexpr int kBoardSize = 9;
 
-// 0 = empty, 1 = X, -1 = O
-
-// All 8 winning lines, in terms of indices into 3x3 board
-__device__ __constant__ int WIN_LINES[8][3] = {
-    {0,1,2}, {3,4,5}, {6,7,8}, // rows
-    {0,3,6}, {1,4,7}, {2,5,8}, // cols
-    {0,4,8}, {2,4,6}           // diagonals
+__device__ __constant__ int kWinLines[8][3] = {
+    {0, 1, 2}, {3, 4, 5}, {6, 7, 8},
+    {0, 3, 6}, {1, 4, 7}, {2, 5, 8},
+    {0, 4, 8}, {2, 4, 6}
 };
 
-__device__ int check_win(const int *board) {
-    // returns 1 if X wins, -1 if O wins, 0 otherwise
-    for (int l = 0; l < 8; ++l) {
-        int a = WIN_LINES[l][0];
-        int b = WIN_LINES[l][1];
-        int c = WIN_LINES[l][2];
-        int sum = board[a] + board[b] + board[c];
-        if (sum == 3)  return 1;
-        if (sum == -3) return -1;
+__device__ int DeviceCheckWin(const int* board) {
+    for (int line = 0; line < 8; ++line) {
+        const int a = kWinLines[line][0];
+        const int b = kWinLines[line][1];
+        const int c = kWinLines[line][2];
+
+        const int sum = board[a] + board[b] + board[c];
+
+        if (sum == 3) {
+            return 1;
+        }
+
+        if (sum == -3) {
+            return -1;
+        }
     }
+
     return 0;
 }
 
-// Common device helper to score a move for a given player
-__device__ int score_move(const int *board, int moveIdx, int player) {
-    if (board[moveIdx] != 0) return -1000; // illegal move
+__device__ int ScoreMove(const int* board, int move_index, int player) {
+    if (board[move_index] != 0) {
+        return -1000;
+    }
 
-    int tmp[BOARD_SIZE];
+    int temp[kBoardSize];
+
     #pragma unroll
-    for (int i = 0; i < BOARD_SIZE; ++i) tmp[i] = board[i];
+    for (int i = 0; i < kBoardSize; ++i) {
+        temp[i] = board[i];
+    }
 
-    tmp[moveIdx] = player;
-    int winner = check_win(tmp);
-    if (winner == player) return 100; // immediate win
+    // Highest priority: make an immediate winning move.
+    temp[move_index] = player;
 
-    // check if this move blocks opponent's immediate win
-    int opp = -player;
-    int blocked = 0;
-    for (int m = 0; m < BOARD_SIZE; ++m) {
-        if (tmp[m] == 0) {
-            tmp[m] = opp;
-            if (check_win(tmp) == opp) blocked = 1;
-            tmp[m] = 0;
+    if (DeviceCheckWin(temp) == player) {
+        return 100;
+    }
+
+    // Second priority: block an immediate opponent win.
+    const int opponent = -player;
+
+    #pragma unroll
+    for (int i = 0; i < kBoardSize; ++i) {
+        temp[i] = board[i];
+    }
+
+    temp[move_index] = opponent;
+
+    if (DeviceCheckWin(temp) == opponent) {
+        return 80;
+    }
+
+    // Positional preference.
+    if (move_index == 4) {
+        return 10;
+    }
+
+    if (move_index == 0 || move_index == 2 ||
+        move_index == 6 || move_index == 8) {
+        return 5;
+    }
+
+    return 3;
+}
+
+__global__ void ChooseMovePlayerA(
+    const int* board,
+    int player,
+    int* scores) {
+
+    const int index = threadIdx.x;
+
+    if (index >= kBoardSize) {
+        return;
+    }
+
+    scores[index] = ScoreMove(board, index, player);
+}
+
+__global__ void ChooseMovePlayerB(
+    const int* board,
+    int player,
+    int* scores) {
+
+    const int index = threadIdx.x;
+
+    if (index >= kBoardSize) {
+        return;
+    }
+
+    int score = ScoreMove(board, index, player);
+
+    if (score <= -1000) {
+        scores[index] = score;
+        return;
+    }
+
+    // Player B uses a slightly different positional strategy.
+    if (index == 0 || index == 2 ||
+        index == 6 || index == 8) {
+        score -= 2;
+    } else if (index != 4) {
+        score += 4;
+    }
+
+    scores[index] = score;
+}
+
+void CheckCuda(cudaError_t error, const char* operation) {
+    if (error != cudaSuccess) {
+        std::fprintf(
+            stderr,
+            "CUDA error during %s: %s\n",
+            operation,
+            cudaGetErrorString(error));
+
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+void PrintBoard(const int* board) {
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) {
+            const int value = board[row * 3 + column];
+
+            char symbol = '.';
+
+            if (value == 1) {
+                symbol = 'X';
+            } else if (value == -1) {
+                symbol = 'O';
+            }
+
+            std::printf("%c ", symbol);
         }
-    }
-    if (blocked) return 80; // good blocking move
 
-    // weaker heuristic: prefer center, then corners, then edges
-    int bonus = 0;
-    if (moveIdx == 4) bonus = 10;                    // center
-    else if (moveIdx == 0 || moveIdx == 2 ||
-             moveIdx == 6 || moveIdx == 8) bonus = 5;// corners
-    else bonus = 3;                                  // edges
-
-    return bonus;
-}
-
-// Player A: greedy, uses the base scoring
-__global__ void choose_move_playerA(const int *board, int player, int *scores) {
-    int idx = threadIdx.x;
-    if (idx >= BOARD_SIZE) return;
-    scores[idx] = score_move(board, idx, player);
-}
-
-// Player B: similar but adds a simple bias to play differently
-__global__ void choose_move_playerB(const int *board, int player, int *scores) {
-    int idx = threadIdx.x;
-    if (idx >= BOARD_SIZE) return;
-    int base = score_move(board, idx, player);
-
-    // simple “style” difference: prefer edges more aggressively,
-    // slightly dislike corners; this changes tie-breaks often
-    if (idx == 4) {
-        base += 0; // neutral
-    } else if (idx == 0 || idx == 2 || idx == 6 || idx == 8) {
-        base -= 2; // corners less attractive
-    } else {
-        base += 4; // edges more attractive
+        std::printf("\n");
     }
 
-    scores[idx] = base;
+    std::printf("\n");
 }
 
-void print_board(const int *board) {
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            int v = board[3*r + c];
-            char ch = '.';
-            if (v == 1)  ch = 'X';
-            if (v == -1) ch = 'O';
-            printf("%c ", ch);
-        }
-        printf("\n");
-    }
-    printf("\n");
-}
-
-int host_check_win(const int *board) {
-    static const int lines[8][3] = {
-        {0,1,2},{3,4,5},{6,7,8},
-        {0,3,6},{1,4,7},{2,5,8},
-        {0,4,8},{2,4,6}
+int HostCheckWin(const int* board) {
+    static const int kHostWinLines[8][3] = {
+        {0, 1, 2}, {3, 4, 5}, {6, 7, 8},
+        {0, 3, 6}, {1, 4, 7}, {2, 5, 8},
+        {0, 4, 8}, {2, 4, 6}
     };
-    for (int l = 0; l < 8; ++l) {
-        int a = lines[l][0], b = lines[l][1], c = lines[l][2];
-        int sum = board[a] + board[b] + board[c];
-        if (sum == 3)  return 1;
-        if (sum == -3) return -1;
+
+    for (int line = 0; line < 8; ++line) {
+        const int a = kHostWinLines[line][0];
+        const int b = kHostWinLines[line][1];
+        const int c = kHostWinLines[line][2];
+
+        const int sum = board[a] + board[b] + board[c];
+
+        if (sum == 3) {
+            return 1;
+        }
+
+        if (sum == -3) {
+            return -1;
+        }
     }
+
     return 0;
 }
 
-bool board_full(const int *board) {
-    for (int i = 0; i < BOARD_SIZE; ++i)
-        if (board[i] == 0) return false;
+bool BoardFull(const int* board) {
+    for (int i = 0; i < kBoardSize; ++i) {
+        if (board[i] == 0) {
+            return false;
+        }
+    }
+
     return true;
 }
 
-int main() {
-    int board[BOARD_SIZE] = {0};
+int PlayGame(int game_number, int* device_board, int* device_scores) {
+    int board[kBoardSize] = {0};
 
-    int *d_board = nullptr;
-    int *d_scores = nullptr;
-    cudaMalloc(&d_board,  BOARD_SIZE * sizeof(int));
-    cudaMalloc(&d_scores, BOARD_SIZE * sizeof(int));
+    int current_player = 1;
 
-    printf("GPU vs GPU Tic-Tac-Toe\n\n");
-
-    int currentPlayer = 1; // 1 = X (Player A), -1 = O (Player B)
-    int moveCount = 0;
+    std::printf("\n============================\n");
+    std::printf("Game %d\n", game_number);
+    std::printf("============================\n\n");
 
     while (true) {
-        printf("Current board:\n");
-        print_board(board);
+        std::printf("Current board:\n");
+        PrintBoard(board);
 
-        // copy board to device
-        cudaMemcpy(d_board, board, BOARD_SIZE * sizeof(int),
-                   cudaMemcpyHostToDevice);
+        CheckCuda(
+            cudaMemcpy(
+                device_board,
+                board,
+                kBoardSize * sizeof(int),
+                cudaMemcpyHostToDevice),
+            "copying board to GPU");
 
-        // launch appropriate kernel
-        if (currentPlayer == 1) {
-            printf("GPU Player A (X) thinking...\n");
-            choose_move_playerA<<<1, BOARD_SIZE>>>(d_board, currentPlayer, d_scores);
+        if (current_player == 1) {
+            std::printf("GPU Player A (X) thinking...\n");
+
+            ChooseMovePlayerA<<<1, kBoardSize>>>(
+                device_board,
+                current_player,
+                device_scores);
         } else {
-            printf("GPU Player B (O) thinking...\n");
-            choose_move_playerB<<<1, BOARD_SIZE>>>(d_board, currentPlayer, d_scores);
+            std::printf("GPU Player B (O) thinking...\n");
+
+            ChooseMovePlayerB<<<1, kBoardSize>>>(
+                device_board,
+                current_player,
+                device_scores);
         }
-        cudaDeviceSynchronize();
 
-        int scores[BOARD_SIZE];
-        cudaMemcpy(scores, d_scores, BOARD_SIZE * sizeof(int),
-                   cudaMemcpyDeviceToHost);
+        CheckCuda(
+            cudaGetLastError(),
+            "launching CUDA kernel");
 
-        // pick best move on host
-        int bestIdx = -1;
-        int bestScore = -100000;
-        for (int i = 0; i < BOARD_SIZE; ++i) {
-            if (scores[i] > bestScore) {
-                bestScore = scores[i];
-                bestIdx = i;
+        CheckCuda(
+            cudaDeviceSynchronize(),
+            "synchronizing CUDA device");
+
+        int scores[kBoardSize];
+
+        CheckCuda(
+            cudaMemcpy(
+                scores,
+                device_scores,
+                kBoardSize * sizeof(int),
+                cudaMemcpyDeviceToHost),
+            "copying move scores from GPU");
+
+        int best_index = -1;
+        int best_score = -100000;
+
+        for (int i = 0; i < kBoardSize; ++i) {
+            if (board[i] == 0 && scores[i] > best_score) {
+                best_score = scores[i];
+                best_index = i;
             }
         }
 
-        if (bestIdx == -1 || board[bestIdx] != 0) {
-            printf("No legal move found. Stopping.\n");
-            break;
+        if (best_index == -1) {
+            std::printf("No legal move found.\n");
+            return 0;
         }
 
-        board[bestIdx] = currentPlayer;
-        moveCount++;
+        board[best_index] = current_player;
 
-        printf("Player %c played position %d (score %d)\n\n",
-               (currentPlayer == 1 ? 'X' : 'O'), bestIdx, bestScore);
+        std::printf(
+            "GPU Player %c selected position %d with score %d\n\n",
+            current_player == 1 ? 'X' : 'O',
+            best_index,
+            best_score);
 
-        int w = host_check_win(board);
-        if (w == 1) {
-            print_board(board);
-            printf("GPU Player A (X) wins!\n");
-            break;
-        } else if (w == -1) {
-            print_board(board);
-            printf("GPU Player B (O) wins!\n");
-            break;
-        } else if (board_full(board)) {
-            print_board(board);
-            printf("Game is a draw.\n");
-            break;
+        const int winner = HostCheckWin(board);
+
+        if (winner == 1) {
+            PrintBoard(board);
+            std::printf("GPU Player A (X) wins!\n");
+            return 1;
         }
 
-        currentPlayer = -currentPlayer; // switch player
+        if (winner == -1) {
+            PrintBoard(board);
+            std::printf("GPU Player B (O) wins!\n");
+            return -1;
+        }
+
+        if (BoardFull(board)) {
+            PrintBoard(board);
+            std::printf("Game is a draw.\n");
+            return 0;
+        }
+
+        current_player = -current_player;
+    }
+}
+
+void PrintUsage(const char* program_name) {
+    std::printf(
+        "Usage: %s [-g number_of_games]\n",
+        program_name);
+
+    std::printf(
+        "Example: %s -g 5\n",
+        program_name);
+}
+
+int main(int argc, char** argv) {
+    int number_of_games = 1;
+
+    for (int i = 1; i < argc; ++i) {
+        if ((std::strcmp(argv[i], "-g") == 0 ||
+             std::strcmp(argv[i], "--games") == 0) &&
+            i + 1 < argc) {
+
+            number_of_games = std::atoi(argv[++i]);
+
+            if (number_of_games <= 0) {
+                std::fprintf(
+                    stderr,
+                    "Number of games must be greater than zero.\n");
+
+                return EXIT_FAILURE;
+            }
+        } else if (
+            std::strcmp(argv[i], "-h") == 0 ||
+            std::strcmp(argv[i], "--help") == 0) {
+
+            PrintUsage(argv[0]);
+            return EXIT_SUCCESS;
+        } else {
+            std::fprintf(
+                stderr,
+                "Unknown command-line argument: %s\n",
+                argv[i]);
+
+            PrintUsage(argv[0]);
+
+            return EXIT_FAILURE;
+        }
     }
 
-    cudaFree(d_board);
-    cudaFree(d_scores);
-    cudaDeviceReset();
-    return 0;
+    int* device_board = nullptr;
+    int* device_scores = nullptr;
+
+    CheckCuda(
+        cudaMalloc(
+            &device_board,
+            kBoardSize * sizeof(int)),
+        "allocating GPU board memory");
+
+    CheckCuda(
+        cudaMalloc(
+            &device_scores,
+            kBoardSize * sizeof(int)),
+        "allocating GPU score memory");
+
+    std::printf("GPU vs GPU Tic-Tac-Toe using CUDA\n");
+    std::printf("Games requested: %d\n", number_of_games);
+
+    int player_a_wins = 0;
+    int player_b_wins = 0;
+    int draws = 0;
+
+    for (int game = 1; game <= number_of_games; ++game) {
+        const int result =
+            PlayGame(game, device_board, device_scores);
+
+        if (result == 1) {
+            ++player_a_wins;
+        } else if (result == -1) {
+            ++player_b_wins;
+        } else {
+            ++draws;
+        }
+    }
+
+    std::printf("\n============================\n");
+    std::printf("Final Results\n");
+    std::printf("============================\n");
+    std::printf("Games: %d\n", number_of_games);
+    std::printf("GPU Player A wins: %d\n", player_a_wins);
+    std::printf("GPU Player B wins: %d\n", player_b_wins);
+    std::printf("Draws: %d\n", draws);
+
+    CheckCuda(
+        cudaFree(device_board),
+        "freeing GPU board memory");
+
+    CheckCuda(
+        cudaFree(device_scores),
+        "freeing GPU score memory");
+
+    CheckCuda(
+        cudaDeviceReset(),
+        "resetting CUDA device");
+
+    return EXIT_SUCCESS;
 }
